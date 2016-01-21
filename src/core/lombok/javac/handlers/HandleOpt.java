@@ -46,6 +46,7 @@ public class HandleOpt extends JavacAnnotationHandler<Opt> {
 	private static final String LOMBOK_OPT = "lombok.Opt";
 	private static final String JAVA_OPTIONAL = "java.util.Optional";
 	private static final String ANNOTATION_PARAM = "def"; // The parameter to specify the default value using @code lombok.Opt, e.g. @Opt(def="3")
+	private static final String MAP_NAME = "map";
 
 	@Override public void handle(AnnotationValues<Opt> annotation, JCAnnotation ast, JavacNode annotationNode) {
 		JavacNode typeNode = annotationNode.up(); // Either a method or a method argument.
@@ -132,15 +133,15 @@ public class HandleOpt extends JavacAnnotationHandler<Opt> {
 			throw new IllegalArgumentException("Non-optional params cannot come after @Opt params.");
 		}
 
-                JavacTreeMaker treeMaker = paramNode.getTreeMaker();
-                JCExpression emptyOptional = getEmptyOptionalJcExpression(treeMaker, paramNode);
+		JavacTreeMaker treeMaker = paramNode.getTreeMaker();
+		JCExpression emptyOptional = getEmptyOptionalJcExpression(treeMaker, paramNode);
 
-                JCModifiers modifiers = methodDecl.getModifiers();
-                List<JCTypeParameter> methodGenericTypes = methodDecl.getTypeParameters();
-                JCExpression methodReturnType = (JCExpression) methodDecl.getReturnType();
-                Name methodName = methodDecl.getName();
-                List<JCVariableDecl> methodParams = methodDecl.getParameters();
-                List<JCExpression> methodThrows = methodDecl.getThrows();
+		JCModifiers modifiers = methodDecl.getModifiers();
+		List<JCTypeParameter> methodGenericTypes = methodDecl.getTypeParameters();
+		JCExpression methodReturnType = (JCExpression) methodDecl.getReturnType();
+		Name methodName = methodDecl.getName();
+		List<JCVariableDecl> methodParams = methodDecl.getParameters();
+		List<JCExpression> methodThrows = methodDecl.getThrows();
 	
 		List<JCVariableDecl> nonOptionalMethodParameters = List.<JCVariableDecl>nil();
 		java.util.List<JCVariableDecl> optionalMethodParams = new java.util.ArrayList<JCVariableDecl>();
@@ -271,7 +272,9 @@ public class HandleOpt extends JavacAnnotationHandler<Opt> {
 			return Boolean.parseBoolean(value);
 		} else if(type.equals("char")) {
 			throw new IllegalArgumentException("chars are currently not supported by @Opt.");
-		} else return value;
+		} else if(type.equals("java.lang.String")) {
+			return value;
+		} else throw new IllegalArgumentException("@Opt can only be used on non-char primitives, Strings, and Optionals.");
 	}
 
 	private static boolean nodeIsTheFirstOptAnnotationInParams(JavacNode paramNode) {
