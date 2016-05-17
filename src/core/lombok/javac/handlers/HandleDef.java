@@ -4,6 +4,9 @@ import static lombok.javac.Javac.*;
 import static lombok.core.handlers.HandlerUtil.*;
 import static lombok.javac.handlers.JavacHandlerUtil.*;
 
+import java.util.LinkedHashMap;
+import java.util.Map;
+
 import lombok.Def;
 import lombok.core.AST.Kind;
 import lombok.core.AnnotationValues;
@@ -38,13 +41,15 @@ import com.sun.tools.javac.util.Name;
 
 /**
  * Handles the {@code lombok.Def} annotation for javac.
+ *
+ * May not work correctly for java versions prior to 8 without some tweaks.
  */
 @ProviderFor(JavacAnnotationHandler.class)
 public class HandleDef extends JavacAnnotationHandler<Def> {
 
 	private static final String VOID = "void";
-	private static final String LOMBOK_DEFAULT = "lombok.Def";
-	private static final String JAVA_OPTIONAL = "java.util.Optional";
+	private static final String LOMBOK_DEF = "lombok.Def";
+	private static final String JAVA_UTIL_OPTIONAL = "java.util.Optional";
 	private static final String MAP_NAME = "paramsMap";
 
 	@Override public void handle(AnnotationValues<Def> annotation, JCAnnotation ast, JavacNode annotationNode) {
@@ -62,16 +67,16 @@ public class HandleDef extends JavacAnnotationHandler<Def> {
 				throw new IllegalArgumentException("@Def is only valid on method arguments.");
 		}
 	}
-	
+
 	private java.util.List<JCMethodDecl> createMethodsForOptionals(JavacNode paramNode) {
-                java.util.List<JCMethodDecl> methodsToInject = new java.util.ArrayList<JCMethodDecl>();
+		java.util.List<JCMethodDecl> methodsToInject = new java.util.ArrayList<JCMethodDecl>();
 		JCMethodDecl methodDecl = getJcMethodDeclFromNode(paramNode.up());
 		JCClassDecl classDecl = (JCClassDecl) paramNode.up().up().get();
 
 		if(paramNode.getKind() != Kind.ARGUMENT) {
-                        throw new IllegalArgumentException("Expected annotation to be applied to parameter.");
-                }
-		if(!nodeIsTheFirstOptAnnotationInParams(paramNode)) {
+			throw new IllegalArgumentException("Expected annotation to be applied to parameter.");
+		}
+		if(!nodeIsTheFirstDefAnnotationInParams(paramNode)) {
 			return new java.util.ArrayList<JCMethodDecl>();
 		}
 		if(nonOptionalComesAfterOptional(methodDecl)) {
@@ -79,33 +84,106 @@ public class HandleDef extends JavacAnnotationHandler<Def> {
 		}
 
 		JavacTreeMaker treeMaker = paramNode.getTreeMaker();
-		JCExpression emptyOptional = getEmptyOptionalJcExpression(treeMaker, paramNode);
-
-		JCModifiers modifiers = methodDecl.getModifiers();
-		List<JCTypeParameter> methodGenericTypes = methodDecl.getTypeParameters();
-		JCExpression methodReturnType = (JCExpression) methodDecl.getReturnType();
-		Name methodName = methodDecl.getName();
 		List<JCVariableDecl> methodParams = methodDecl.getParameters();
-		List<JCExpression> methodThrows = methodDecl.getThrows();
-	
 		List<JCVariableDecl> requiredMethodParams = List.<JCVariableDecl>nil();
-		java.util.List<JCVariableDecl> optionalMethodParams = new java.util.ArrayList<JCVariableDecl>();
-		java.util.List<String> defaultValues = new java.util.ArrayList<String>();
+		Map<JCVariableDecl, String> optionalArgumentToDefaultValueMap = new LinkedHashMap<JCVariableDecl, String>();
 		for(JCVariableDecl var : methodParams) {
 			boolean optional = false;
 			for(JCAnnotation ann : var.getModifiers().getAnnotations()) {
-				if(ann.type.toString().equals(LOMBOK_DEFAULT)) {
-					optionalMethodParams.add(var);
+				if(ann.type.toString().equals(LOMBOK_DEF)) {
 					if(isJavaOptional(var)) {
-						defaultValues.add(""); // No default string needed for optionals, default is always Optional.empty().
+						// No default string needed for optionals, default is always Optional.empty().
+						optionalArgumentToDefaultValueMap.put(var, "");
 					} else {
-						addAnnotationDefault(ann, defaultValues);
+						optionalArgumentToDefaultValueMap.put(var, getDefaultFromAnnotation(ann));
 					}
 					optional = true;
 				}
 			}
 			if(!optional) requiredMethodParams = requiredMethodParams.append(var);
 		}
+
+		JCMethodDecl methodWithoutDefaults = getMethodWithoutDefaults(methodDecl, paramNode, requiredMethodParams,
+		                                                              optionalArgumentToDefaultValueMap, treeMaker);
+		JCMethodDecl methodWithMap = getMethodWithMap(methodDecl, paramNode, requiredMethodParams,
+		                                              optionalArgumentToDefaultValueMap, treeMaker);
+		methodsToInject.add(methodWithoutDefaults);
+		methodsToInject.add(methodWithMap);
+		return methodsToInject;
+	}
+
+	/*
+	 * Creates a version of the method without the default parameters in the signature.
+	 * e.g. foo(String x, String y, @Def("2") int z) {}
+	 * will have foo(String x, String y) { foo(x, y, 2); } auto-generated.
+	 */
+	private JCMethodDecl getMethodWithoutDefaults(JCMethodDecl originalMethod,
+	                                              JavacNode paramNode,
+	                                              List<JCVariableDecl> requiredMethodParams,
+	                                              Map<JCVariableDecl, String> optionalArgumentToDefaultValueMap,
+	                                              JavacTreeMaker treeMaker) {
+		JCExpression emptyOptional = getEmptyOptionalJcExpression(treeMaker, paramNode);
+		JCExpression methodReturnType = (JCExpression) originalMethod.getReturnType();
+
+		List<JCExpression> innerMethodParamExpressions = List.<JCExpression>nil();
+		// First, add all non-optional params to the inner method.
+		for(JCVariableDecl var : requiredMethodParams) {
+			innerMethodParamExpressions = innerMethodParamExpressions.append(treeMaker.Ident(var.name));
+		}
+		// Then, append all the default values as literals
+		for(Map.Entry<JCVariableDecl, String> entry : optionalArgumentToDefaultValueMap.entrySet()) {
+			String type = entry.getKey().getType().type.tsym.toString();
+			String value = entry.getValue();
+			if(type.equals(JAVA_UTIL_OPTIONAL)) {
+				innerMethodParamExpressions = innerMethodParamExpressions.append(emptyOptional);
+			} else if(type.equals("char")) {
+				// Compiler complains if a char is passed to treeMaker.literal
+				JCExpression intLiteral = treeMaker.Literal(getObject(type, value));
+				JCTypeCast castIntToChar = treeMaker.TypeCast(entry.getKey().getType(), intLiteral);
+				innerMethodParamExpressions = innerMethodParamExpressions.append(castIntToChar);
+			} else {
+				innerMethodParamExpressions = innerMethodParamExpressions.append(treeMaker.Literal(getObject(type, value)));
+			}
+		}
+
+		JCExpression innerMethod = JavacHandlerUtil.chainDotsString(paramNode, originalMethod.getName().toString());
+		List<JCExpression> typeParamExpressions = getTypeParamsAsJcExpressions(originalMethod.getTypeParameters());
+		JCMethodInvocation methodInvocation = treeMaker.Apply(typeParamExpressions, innerMethod, innerMethodParamExpressions);
+		ListBuffer<JCStatement> statements = new ListBuffer<JCStatement>();
+		if(methodReturnType.toString().equals(VOID)) {
+			JCStatement statement = treeMaker.Exec((JCExpression) methodInvocation.getTree());
+			statements.add(statement);
+		} else {
+			JCReturn returnStatement = treeMaker.Return((JCExpression) methodInvocation.getTree());
+			statements.add(returnStatement);
+		}
+		JCBlock methodBody = treeMaker.Block(0, statements.toList());
+
+		JCModifiers modifiers = originalMethod.getModifiers();
+		List<JCTypeParameter> methodGenericTypes = originalMethod.getTypeParameters();
+		Name methodName = originalMethod.getName();
+		List<JCVariableDecl> methodParams = originalMethod.getParameters();
+		List<JCExpression> methodThrows = originalMethod.getThrows();
+		return treeMaker.MethodDef(modifiers, methodName, methodReturnType, methodGenericTypes,
+		                           requiredMethodParams, methodThrows, methodBody, null);
+	}
+
+	/*
+	 * Creates a version of the method with the default params passed in as a Map<String, Object>.
+	 * e.g. foo(String x, @Def("2") int y) {}
+	 * will auto-generate
+	 * foo(String x, Map<String, Object> paramsMap) {
+	 *     foo(x, paramsMap.containsKey("y") ? (int) paramsMap.get("y") : 2);
+	 * }
+	 */
+	private JCMethodDecl getMethodWithMap(JCMethodDecl originalMethod,
+	                                      JavacNode paramNode,
+	                                      List<JCVariableDecl> requiredMethodParams,
+	                                      Map<JCVariableDecl, String> optionalArgumentToDefaultValueMap,
+	                                      JavacTreeMaker treeMaker) {
+		JCClassDecl classDecl = (JCClassDecl) paramNode.up().up().get();
+		JCExpression emptyOptional = getEmptyOptionalJcExpression(treeMaker, paramNode);
+		JCExpression methodReturnType = (JCExpression) originalMethod.getReturnType();
 
 		// Create a version of the method with all optional parameters passed in as a Map<String, Object>.
 		List<JCExpression> innerMethodParamsForMapMethod = List.<JCExpression>nil();
@@ -115,8 +193,10 @@ public class HandleDef extends JavacAnnotationHandler<Def> {
 		// For each of the optional params, we will make a JCConditional (JCExpression) of the form
 		// map.containsKey(argName) ? (TypeCast) map.get(argName) : defaultValue
 		// and add that JCConditional to the inner method params.
-		for(int i=0; i<optionalMethodParams.size(); i++) {
-			String argName = optionalMethodParams.get(i).getName().toString();
+		for(Map.Entry<JCVariableDecl, String> entry : optionalArgumentToDefaultValueMap.entrySet()) {
+			JCVariableDecl variable = entry.getKey();
+			String value = entry.getValue();
+			String argName = variable.getName().toString();
 			JCExpression argNameAsExpression = treeMaker.Literal(getObject("java.lang.String", argName));
 			List<JCExpression> argNameExpressions = List.<JCExpression>nil();
 			argNameExpressions = argNameExpressions.append(argNameAsExpression);
@@ -125,27 +205,31 @@ public class HandleDef extends JavacAnnotationHandler<Def> {
 			JCExpression containsKey = JavacHandlerUtil.chainDots(paramNode, MAP_NAME, "containsKey");
 			JCMethodInvocation containsKeyInvocation = treeMaker.Apply(List.<JCExpression>nil(), containsKey, argNameExpressions);
 
-			// Then make map.get(argName)
+			// Then make (TypeCast) map.get(argName)
 			JCExpression get = JavacHandlerUtil.chainDots(paramNode, MAP_NAME, "get");
 			JCMethodInvocation getInvocation = treeMaker.Apply(List.<JCExpression>nil(), get, argNameExpressions);
-			JCTypeCast typeCast = treeMaker.TypeCast(optionalMethodParams.get(i).vartype, getInvocation);
+			JCTypeCast typeCast = treeMaker.TypeCast(variable.vartype, getInvocation);
 
-			// Last get the default value expression
+			// Finally get the default value expression.
 			JCExpression defaultValue;
-			String value = defaultValues.get(i);
-			String type = optionalMethodParams.get(i).getType().type.tsym.toString();
-			if(type.equals(JAVA_OPTIONAL)) {
+			String type = variable.getType().type.tsym.toString();
+			if(type.equals(JAVA_UTIL_OPTIONAL)) {
 				defaultValue = emptyOptional;
+			} else if(type.equals("char")) {
+				// Compiler complains if a char is passed to treeMaker.literal
+				JCExpression intLiteral = treeMaker.Literal(getObject(type, value));
+				JCTypeCast castIntToChar = treeMaker.TypeCast(variable.getType(), intLiteral);
+				defaultValue = castIntToChar;
 			} else {
 				defaultValue = treeMaker.Literal(getObject(type, value));
 			}
 
 			JCConditional conditional = treeMaker.Conditional(containsKeyInvocation, typeCast, defaultValue);
-			// Add the JCConditional to the methodParams
-			innerMethodParamsForMapMethod = innerMethodParamsForMapMethod.append(conditional);						
+			// Add the JCConditional to the methodParams.
+			innerMethodParamsForMapMethod = innerMethodParamsForMapMethod.append(conditional);
 		}
-		JCExpression innerMethod = JavacHandlerUtil.chainDotsString(paramNode, methodName.toString());
-		List<JCExpression> typeParamExpressions = getTypeParamsAsJcExpressions(methodGenericTypes);
+		JCExpression innerMethod = JavacHandlerUtil.chainDotsString(paramNode, originalMethod.getName().toString());
+		List<JCExpression> typeParamExpressions = getTypeParamsAsJcExpressions(originalMethod.getTypeParameters());
 		JCMethodInvocation methodInvocation = treeMaker.Apply(typeParamExpressions, innerMethod, innerMethodParamsForMapMethod);
 		ListBuffer<JCStatement> statements = new ListBuffer<JCStatement>();
 		if(methodReturnType.toString().equals(VOID)) {
@@ -172,7 +256,7 @@ public class HandleDef extends JavacAnnotationHandler<Def> {
 
 		char[] stringCharArr = "String".toCharArray();
 		char[] objectCharArr = "Object".toCharArray();
-		
+
 		Name stringName = classDecl.name.table.fromChars(stringCharArr, 0, stringCharArr.length);
 		Name objectName = classDecl.name.table.fromChars(objectCharArr, 0, objectCharArr.length);
 		JCIdent stringIdent = treeMaker.Ident(stringName);
@@ -187,87 +271,42 @@ public class HandleDef extends JavacAnnotationHandler<Def> {
 		JCTypeApply typeApply = treeMaker.TypeApply(javaUtilMapField, argsList);
 		JCVariableDecl mapVar = treeMaker.VarDef(treeMaker.Modifiers(Flags.PARAMETER | Flags.FINAL), varName, typeApply, null);
 		mapVar.pos = 50000;
-		
-		JCExpression defaultValue = null;
-		JCBlock methodBodyWithAllDefaults = getMethodBodyWithAllDefaults(paramNode, treeMaker, requiredMethodParams, 
-								optionalMethodParams, defaultValues, methodReturnType, methodName, methodGenericTypes);
-		JCMethodDecl methodWithAllDefaults = treeMaker.MethodDef(modifiers, methodName, methodReturnType, methodGenericTypes,
-								requiredMethodParams, methodThrows, methodBodyWithAllDefaults, defaultValue);
-
 		requiredMethodParams = requiredMethodParams.append(mapVar);
-		JCMethodDecl methodWithMap = treeMaker.MethodDef(modifiers, methodName, methodReturnType, methodGenericTypes,
-							 requiredMethodParams, methodThrows, methodBody, defaultValue);
 
-		methodsToInject.add(methodWithAllDefaults);
-		methodsToInject.add(methodWithMap);
-		return methodsToInject;
-	}
-
-	private static JCBlock getMethodBodyWithAllDefaults(JavacNode paramNode, JavacTreeMaker treeMaker, List<JCVariableDecl> requiredMethodParams, 
-							java.util.List<JCVariableDecl> optionalMethodParams, java.util.List<String> defaultValues,
-							JCExpression methodReturnType, Name methodName, List<JCTypeParameter> methodGenericTypes) {
-		JCExpression emptyOptional = getEmptyOptionalJcExpression(treeMaker, paramNode);
-		List<JCExpression> innerMethodParamExpressions = List.<JCExpression>nil();
-		// First, add all non-optional params to the inner method.
-		for(JCVariableDecl var : requiredMethodParams) {
-			innerMethodParamExpressions = innerMethodParamExpressions.append(treeMaker.Ident(var.name));
-		}
-		// Then, append all the default values as literals
-		for(int i=0; i<defaultValues.size(); i++) {
-			String value = defaultValues.get(i);
-			String type = optionalMethodParams.get(i).getType().type.tsym.toString();
-			if(type.equals(JAVA_OPTIONAL)) {
-				innerMethodParamExpressions = innerMethodParamExpressions.append(emptyOptional);
-			} else {
-				innerMethodParamExpressions = innerMethodParamExpressions.append(treeMaker.Literal(getObject(type, value)));
-			}
-		}
-
-		JCExpression innerMethod = JavacHandlerUtil.chainDotsString(paramNode, methodName.toString());
-		List<JCExpression> typeParamExpressions = getTypeParamsAsJcExpressions(methodGenericTypes);
-		JCMethodInvocation methodInvocation = treeMaker.Apply(typeParamExpressions, innerMethod, innerMethodParamExpressions);
-		ListBuffer<JCStatement> statements = new ListBuffer<JCStatement>();
-		if(methodReturnType.toString().equals(VOID)) {
-			JCStatement statement = treeMaker.Exec((JCExpression) methodInvocation.getTree());
-			statements.add(statement);
-		} else {
-			JCReturn returnStatement = treeMaker.Return((JCExpression) methodInvocation.getTree());
-			statements.add(returnStatement);
-		}
-		JCBlock methodBody = treeMaker.Block(0, statements.toList());
-
-		return methodBody;
+		JCModifiers modifiers = originalMethod.getModifiers();
+		List<JCTypeParameter> methodGenericTypes = originalMethod.getTypeParameters();
+		Name methodName = originalMethod.getName();
+		List<JCVariableDecl> methodParams = originalMethod.getParameters();
+		List<JCExpression> methodThrows = originalMethod.getThrows();
+		return treeMaker.MethodDef(modifiers, methodName, methodReturnType, methodGenericTypes,
+		                           requiredMethodParams, methodThrows, methodBody, null);
 	}
 
 	private static boolean nonOptionalComesAfterOptional(JCMethodDecl methodDecl) {
 		List<JCVariableDecl> methodParams = methodDecl.getParameters();
 		boolean optionalFound = false;
-                for(JCVariableDecl var : methodParams) {
-                        boolean thisVarIsOptional = false;
-                        for(JCAnnotation ann : var.getModifiers().getAnnotations()) {
-                                if(ann.type.toString().equals(LOMBOK_DEFAULT)) {
+		for(JCVariableDecl var : methodParams) {
+			boolean thisVarIsOptional = false;
+			for(JCAnnotation ann : var.getModifiers().getAnnotations()) {
+				if(ann.type.toString().equals(LOMBOK_DEF)) {
 					optionalFound = true;
 					thisVarIsOptional = true;
-                                }
-                        }
+				}
+			}
 			if(optionalFound && !thisVarIsOptional) return true;
-                }
+		}
 		return false;
 	}
 
-	private static void addAnnotationDefault(JCAnnotation ann, java.util.List<String> defaultValues) {
-		boolean foundDefault = false;
+	private static String getDefaultFromAnnotation(JCAnnotation ann) {
 		for(JCExpression jce : ann.args) {
 			JCAssign assign = (JCAssign) jce;
 			String value = assign.rhs.toString();
-			value = value.replaceAll("\"", "");
-			defaultValues.add(value);
-			foundDefault = true;
-			break;
+			value = value.substring(1, value.length()-1); // Removes the quotes from start and end.
+			return value;
 		}
-		if(!foundDefault) {
-			throw new IllegalArgumentException("You must provide a default value when using @Def with a non-java.util.Optional method parameter.");
-		}
+		throw new IllegalArgumentException("You must provide a default value when using @Def "+
+		                                   "with a non-java.util.Optional method parameter.");
 	}
 
 	private static JCMethodDecl getJcMethodDeclFromNode(JavacNode methodNode) {
@@ -283,7 +322,7 @@ public class HandleDef extends JavacAnnotationHandler<Def> {
 
 	private static boolean isJavaOptional(JCVariableDecl var) {
 		String varType = var.getType().type.tsym.toString();
-		return varType.equals(JAVA_OPTIONAL);
+		return varType.equals(JAVA_UTIL_OPTIONAL);
 	}
 
 	private static Object getObject(String type, String value) {
@@ -302,18 +341,36 @@ public class HandleDef extends JavacAnnotationHandler<Def> {
 		} else if(type.equals("boolean")) {
 			return Boolean.parseBoolean(value);
 		} else if(type.equals("char")) {
-			throw new IllegalArgumentException("chars are currently not supported by @Def.");
+			if(value.equals("\\t")) {
+				return (int) '\t';
+			} else if(value.equals("\\b")) {
+				return (int) '\b';
+			} else if(value.equals("\\n")) {
+				return (int) '\n';
+			} else if(value.equals("\\f")) {
+				return (int) '\f';
+			} else if(value.equals("\\r")) {
+				return (int) '\r';
+			} else if(value.equals("\\\\")) {
+				return (int) '\\';
+			} else if(value.equals("\\\"")) {
+				return (int) '"';
+			} else if(value.equals("\\'")) {
+				return (int) '\'';
+			} else {
+				return (int) value.charAt(0);
+			}
 		} else if(type.equals("java.lang.String")) {
 			return value;
 		} else throw new IllegalArgumentException("@Def can only be used on non-char primitives, Strings, and Optionals.");
 	}
 
-	private static boolean nodeIsTheFirstOptAnnotationInParams(JavacNode paramNode) {
+	private static boolean nodeIsTheFirstDefAnnotationInParams(JavacNode paramNode) {
 		JCMethodDecl methodDecl = getJcMethodDeclFromNode(paramNode.up());
 		List<JCVariableDecl> methodParams = methodDecl.getParameters();
 		for(JCVariableDecl var : methodParams) {
 			for(JCAnnotation ann : var.getModifiers().getAnnotations()) {
-				if(ann.type.toString().equals(LOMBOK_DEFAULT)) {
+				if(ann.type.toString().equals(LOMBOK_DEF)) {
 					if(var.getName().toString().equals(paramNode.getName().toString())) {
 						return true;
 					}
