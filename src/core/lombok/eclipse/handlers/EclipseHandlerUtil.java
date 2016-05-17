@@ -72,6 +72,7 @@ import org.eclipse.jdt.internal.compiler.ast.FieldDeclaration;
 import org.eclipse.jdt.internal.compiler.ast.FieldReference;
 import org.eclipse.jdt.internal.compiler.ast.IfStatement;
 import org.eclipse.jdt.internal.compiler.ast.IntLiteral;
+import org.eclipse.jdt.internal.compiler.ast.LongLiteral;
 import org.eclipse.jdt.internal.compiler.ast.MarkerAnnotation;
 import org.eclipse.jdt.internal.compiler.ast.MemberValuePair;
 import org.eclipse.jdt.internal.compiler.ast.MessageSend;
@@ -1579,25 +1580,59 @@ public class EclipseHandlerUtil {
 		return result;
 	}
 	
+	/**
+	 * In eclipse 3.7+, LongLiterals are created using a factory-method
+	 * Unfortunately that means we need to use reflection as we want to be compatible
+	 * with eclipse versions before 3.7.
+	 */
+	public static LongLiteral makeLongLiteral(char[] token, ASTNode source) {
+		int pS = source == null ? 0 : source.sourceStart, pE = source == null ? 0 : source.sourceEnd;
+		LongLiteral result;
+		try {
+			if (longLiteralConstructor != null) {
+				result = longLiteralConstructor.newInstance(token, pS, pE);
+			} else {
+				result = (LongLiteral) longLiteralFactoryMethod.invoke(null, token, pS, pE);
+			}
+		} catch (InvocationTargetException e) {
+			throw Lombok.sneakyThrow(e.getCause());
+		} catch (IllegalAccessException e) {
+			throw Lombok.sneakyThrow(e);
+		} catch (InstantiationException e) {
+			throw Lombok.sneakyThrow(e);
+		}
+
+		if (source != null) setGeneratedBy(result, source);
+		return result;
+	}
+
 	private static final Constructor<IntLiteral> intLiteralConstructor;
 	private static final Method intLiteralFactoryMethod;
+	private static final Constructor<LongLiteral> longLiteralConstructor;
+	private static final Method longLiteralFactoryMethod;
 	
 	static {
 		Class<?>[] parameterTypes = {char[].class, int.class, int.class};
 		Constructor<IntLiteral> intLiteralConstructor_ = null;
 		Method intLiteralFactoryMethod_ = null;
+		Constructor<LongLiteral> longLiteralConstructor_ = null;
+		Method longLiteralFactoryMethod_ = null;
 		try { 
 			intLiteralConstructor_ = IntLiteral.class.getConstructor(parameterTypes);
+			longLiteralConstructor_ = LongLiteral.class.getConstructor(parameterTypes);
 		} catch (Throwable ignore) {
 			// probably eclipse 3.7++
 		}
 		try { 
 			intLiteralFactoryMethod_ = IntLiteral.class.getMethod("buildIntLiteral", parameterTypes);
+			longLiteralFactoryMethod_ = LongLiteral.class.getMethod("buildLongLiteral", parameterTypes);
 		} catch (Throwable ignore) {
 			// probably eclipse versions before 3.7
 		}
 		intLiteralConstructor = intLiteralConstructor_;
 		intLiteralFactoryMethod = intLiteralFactoryMethod_;
+		longLiteralConstructor = longLiteralConstructor_;
+		longLiteralFactoryMethod = longLiteralFactoryMethod_;
 	}
 	
 	private static boolean isAllValidOnXCharacters(char[] in) {
